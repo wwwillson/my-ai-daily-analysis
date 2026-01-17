@@ -2,162 +2,214 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import pandas_ta as ta
+import mplfinance as mpf
+import numpy as np
 
 # ==========================================
 # 1. 頁面設定
 # ==========================================
-st.set_page_config(layout="wide", page_title="硬派演算法 K線分析")
-st.title("⚡ 雙時區演算法交易訊號 (無 AI 版)")
-st.markdown("此工具不依賴 AI 圖片辨識，而是直接抓取數據進行數學邏輯運算。")
+st.set_page_config(layout="wide", page_title="Price Action 波段策略分析")
+st.title("📈 雙時區 Price Action 策略 (仿影片邏輯)")
+st.markdown("""
+**策略核心 (基於影片歸納)：**
+1. **日線 (Daily)**：識別趨勢，自動尋找並畫出「關鍵支撐/阻力位」(Key Levels)。
+2. **4小時 (4H)**：在關鍵位附近尋找「吞噬形態 (Engulfing)」作為入場確認。
+""")
 
 # ==========================================
-# 2. 側邊欄：使用者輸入
+# 2. 側邊欄輸入
 # ==========================================
 with st.sidebar:
-    st.header("參數設定")
-    symbol = st.text_input("輸入代號 (如 BTC-USD, AAPL, 2330.TW)", value="BTC-USD")
-    
+    st.header("設定")
+    symbol = st.text_input("輸入代號 (如 BTC-USD, NVDA, 2330.TW)", value="BTC-USD")
+    lookback_days = st.slider("日線回溯天數 (找支撐壓力用)", 100, 730, 365)
+    sensitivity = st.slider("關鍵位敏感度 (數值越小線越少)", 1, 5, 2)
     st.markdown("---")
-    st.subheader("策略參數")
-    ma_period = st.number_input("日線趨勢均線 (MA)", value=50, min_value=10)
-    kd_threshold = st.number_input("4H KD 低檔買進區 (<數值)", value=30, max_value=50)
+    st.info("提示：若找不到數據，請確認代號是否正確。")
 
 # ==========================================
-# 3. 核心邏輯函數 (修正了 Truth Value 錯誤)
+# 3. 核心運算函數
 # ==========================================
-def fetch_and_analyze(symbol):
+
+def is_support(df, i):
+    # 判斷是否為局部低點 (Fractal Low)
+    cond1 = df['Low'][i] < df['Low'][i-1]
+    cond2 = df['Low'][i] < df['Low'][i+1]
+    cond3 = df['Low'][i+1] < df['Low'][i+2]
+    cond4 = df['Low'][i-1] < df['Low'][i-2]
+    return cond1 and cond2 and cond3 and cond4
+
+def is_resistance(df, i):
+    # 判斷是否為局部高點 (Fractal High)
+    cond1 = df['High'][i] > df['High'][i-1]
+    cond2 = df['High'][i] > df['High'][i+1]
+    cond3 = df['High'][i+1] > df['High'][i+2]
+    cond4 = df['High'][i-1] > df['High'][i-2]
+    return cond1 and cond2 and cond3 and cond4
+
+def find_levels(df):
+    # 尋找關鍵支撐與壓力位
+    levels = []
+    # 使用平均蠟燭長度來過濾太近的線
+    mean_candle_size = np.mean(df['High'] - df['Low'])
+    
+    for i in range(2, df.shape[0] - 2):
+        if is_support(df, i):
+            l = df['Low'][i]
+            # 檢查是否已經有相近的線 (合併附近的支撐壓力)
+            if np.sum([abs(l - x) < mean_candle_size * 2 for x in levels]) == 0:
+                levels.append((i, l, "Support"))
+        elif is_resistance(df, i):
+            l = df['High'][i]
+            if np.sum([abs(l - x) < mean_candle_size * 2 for x in levels]) == 0:
+                levels.append((i, l, "Resistance"))
+    return levels
+
+def check_engulfing(open_curr, close_curr, open_prev, close_prev, trend_direction):
+    # 判斷吞噬形態
+    # 1. 多頭吞噬 (Bullish Engulfing) - 在上升趨勢或支撐位
+    if trend_direction in ["UP", "RANGE"]:
+        if (close_curr > open_curr) and (close_prev < open_prev): # 今紅昨黑
+            if (close_curr > open_prev) and (open_curr < close_prev): # 實體包覆
+                return "🟢 多頭吞噬 (買入訊號)"
+    
+    # 2. 空頭吞噬 (Bearish Engulfing) - 在下跌趨勢或壓力位
+    if trend_direction in ["DOWN", "RANGE"]:
+        if (close_curr < open_curr) and (close_prev > open_prev): # 今黑昨紅
+            if (close_curr < open_prev) and (open_curr > close_prev): # 實體包覆
+                return "🔴 空頭吞噬 (賣出訊號)"
+    
+    return None
+
+def fetch_data(symbol, days):
     try:
-        # 1. 抓取日線數據 (判斷大趨勢)
-        df_day = yf.download(symbol, period="1y", interval="1d", progress=False)
+        # 1. 抓取日線
+        df_daily = yf.download(symbol, period=f"{days}d", interval="1d", progress=False)
         
-        # 2. 抓取小時線數據 (模擬 4H/短線 找買點)
-        df_intraday = yf.download(symbol, period="1mo", interval="1h", progress=False)
-
-        # --- 修正重點 A: 處理 yfinance 可能回傳的多層索引 (MultiIndex) ---
-        if isinstance(df_day.columns, pd.MultiIndex):
-            df_day.columns = df_day.columns.get_level_values(0)
-        if isinstance(df_intraday.columns, pd.MultiIndex):
-            df_intraday.columns = df_intraday.columns.get_level_values(0)
-
-        # 檢查數據是否為空
-        if df_day.empty or df_intraday.empty:
-            return None, None, "❌ 抓不到數據，請確認代號是否正確"
-
-        # --- 步驟 A: 日線邏輯 ---
-        # 計算 SMA
-        df_day['MA_Trend'] = ta.sma(df_day['Close'], length=ma_period)
+        # 2. 抓取小時線並重組為 4小時線 (因為 yf 免費版 4h 不穩定)
+        df_1h = yf.download(symbol, period="2mo", interval="1h", progress=False)
         
-        # 取得最新一天的收盤價與 MA (修正重點 B: 使用 .iloc[-1].item() 強制轉為純數字)
-        try:
-            current_price = df_day['Close'].iloc[-1]
-            # 如果是 Series (單一值但帶索引)，轉為 float
-            if isinstance(current_price, pd.Series):
-                current_price = float(current_price.iloc[0])
-            else:
-                current_price = float(current_price)
+        # 處理 MultiIndex (yfinance 新版修正)
+        if isinstance(df_daily.columns, pd.MultiIndex):
+            df_daily.columns = df_daily.columns.get_level_values(0)
+        if isinstance(df_1h.columns, pd.MultiIndex):
+            df_1h.columns = df_1h.columns.get_level_values(0)
+            
+        if df_daily.empty or df_1h.empty:
+            return None, None, None
 
-            current_ma = df_day['MA_Trend'].iloc[-1]
-            if isinstance(current_ma, pd.Series):
-                current_ma = float(current_ma.iloc[0])
-            else:
-                current_ma = float(current_ma)
-        except:
-            # 萬一數據不足導致無法計算
-            return None, None, "⚠️ 數據計算錯誤，可能是歷史資料不足"
-        
-        # 判斷趨勢
-        trend_bool = current_price > current_ma
-        trend_status = "🟢 多頭 (看漲)" if trend_bool else "🔴 空頭 (看跌)"
+        # 重採樣 1H -> 4H
+        ohlc_dict = {
+            'Open': 'first',
+            'High': 'max',
+            'Low': 'min',
+            'Close': 'last',
+            'Volume': 'sum'
+        }
+        df_4h = df_1h.resample('4h').agg(ohlc_dict).dropna()
 
-        # --- 步驟 B: 小時線/4H 邏輯 ---
-        # 計算 KD 指標
-        k_period = 9
-        d_period = 3
-        stoch = ta.stoch(df_intraday['High'], df_intraday['Low'], df_intraday['Close'], k=k_period, d=d_period)
-        
-        # 把計算結果合併回去
-        df_intraday = pd.concat([df_intraday, stoch], axis=1)
-        
-        # 取得 KD 值 (修正重點 C: 確保取出來的是純數字)
-        # STOCHk 和 STOCHd 通常在最後兩欄
-        def get_scalar(series_val):
-            if isinstance(series_val, pd.Series):
-                return float(series_val.iloc[0])
-            return float(series_val)
-
-        latest_k = get_scalar(df_intraday.iloc[-1, -2])
-        latest_d = get_scalar(df_intraday.iloc[-1, -1])
-        prev_k = get_scalar(df_intraday.iloc[-2, -2])
-        prev_d = get_scalar(df_intraday.iloc[-2, -1])
-
-        # 判斷是否黃金交叉
-        # 現在 K > D 且 之前 K < D
-        is_gold_cross = (latest_k > latest_d) and (prev_k < prev_d)
-        is_low_level = latest_k < kd_threshold
-        
-        entry_signal = "無訊號"
-        if is_gold_cross and is_low_level:
-            entry_signal = "🚀 黃金交叉 (買點出現!)"
-        elif is_low_level:
-            entry_signal = "⚠️ 進入超賣區 (等待交叉)"
-        else:
-            entry_signal = "觀望中"
-
-        # --- 綜合建議 ---
-        advice = ""
-        if trend_bool and (is_gold_cross and is_low_level):
-            advice = "🔥 強烈建議買進 (趨勢向上 + 短線起漲)"
-        elif not trend_bool:
-            advice = "⛔ 日線趨勢向下，不建議做多"
-        else:
-            advice = "👀 趨勢向上，但短線尚未出現明確買訊"
-
-        return {
-            "price": current_price,
-            "ma": current_ma,
-            "trend": trend_status,
-            "k": latest_k,
-            "d": latest_d,
-            "signal": entry_signal,
-            "advice": advice
-        }, df_day, df_intraday
+        return df_daily, df_4h, None
 
     except Exception as e:
-        # 捕捉所有異常並回傳
-        return None, None, f"程式內部錯誤: {str(e)}"
+        return None, None, str(e)
 
 # ==========================================
-# 4. 執行與顯示
+# 4. 分析與顯示邏輯
 # ==========================================
-if st.button("開始分析", type="primary"):
-    with st.spinner("正在連線至交易所抓取數據並計算..."):
-        result, df_d, df_h = fetch_and_analyze(symbol)
+if st.button("🚀 開始智能分析", type="primary"):
+    with st.spinner("正在進行雙時區結構運算..."):
+        df_d, df_4h, err = fetch_data(symbol, lookback_days)
         
-        if result:
-            # 顯示結果
-            st.markdown(f"### 🎯 最終建議：{result['advice']}")
+        if err:
+            st.error(f"數據錯誤: {err}")
+        elif df_d is not None:
             
+            # --- A. 日線分析 (趨勢 & 關鍵位) ---
+            levels = find_levels(df_d)
+            current_price = df_d['Close'].iloc[-1]
+            
+            # 簡單趨勢過濾 (價格 vs 50MA)
+            ma50 = df_d['Close'].rolling(50).mean().iloc[-1]
+            trend = "UP" if current_price > ma50 else "DOWN"
+            
+            # 找出最近的關鍵位 (只顯示最近的 2 條線)
+            level_prices = [l[1] for l in levels]
+            level_prices.sort(key=lambda x: abs(x - current_price))
+            nearby_levels = level_prices[:2]
+
+            # --- B. 4H 分析 (入場訊號) ---
+            # 取得最後兩根 4H K線
+            curr_4h = df_4h.iloc[-1]
+            prev_4h = df_4h.iloc[-2]
+            
+            signal = check_engulfing(
+                curr_4h['Open'], curr_4h['Close'], 
+                prev_4h['Open'], prev_4h['Close'], 
+                trend
+            )
+            
+            # 判斷價格是否靠近關鍵位 (Buffer 2%)
+            is_near_level = False
+            for lvl in nearby_levels:
+                if abs(current_price - lvl) / current_price < 0.02: # 2% 誤差內
+                    is_near_level = True
+            
+            final_decision = "觀望"
+            if signal and is_near_level:
+                final_decision = f"🔥 {signal} (且位於關鍵位附近)"
+            elif signal:
+                final_decision = f"⚠️ {signal} (但未緊貼日線關鍵位)"
+            elif is_near_level:
+                final_decision = "👀 價格回到關鍵位 (等待 4H 吞噬形態)"
+
+            # --- C. 顯示結果 ---
+            
+            # 1. 文字報告
+            st.markdown(f"### 🎯 分析結果：{final_decision}")
             col1, col2 = st.columns(2)
-            
             with col1:
-                st.subheader("1. 日線趨勢分析")
-                st.metric("目前價格", f"{result['price']:.2f}")
-                st.metric(f"{ma_period}日均線 (MA)", f"{result['ma']:.2f}")
-                st.info(f"趨勢判定：{result['trend']}")
-                st.line_chart(df_d[['Close', 'MA_Trend']])
-
+                st.info(f"**日線趨勢**：{'📈 上升 (價格 > 50MA)' if trend=='UP' else '📉 下跌 (價格 < 50MA)'}")
+                st.metric("目前價格", f"{current_price:.2f}")
             with col2:
-                st.subheader("2. 短線進場分析 (KD指標)")
-                st.metric("K值", f"{result['k']:.2f}")
-                st.metric("D值", f"{result['d']:.2f}")
-                st.info(f"訊號判定：{result['signal']}")
-                # 畫 KD 線 (只畫最近 100 根)
-                if df_h is not None and df_h.shape[1] > 2:
-                    st.line_chart(df_h.iloc[-100:, -2:]) 
-        
-        else:
-            # 顯示 fetch_and_analyze 回傳的錯誤訊息
-            st.error(df_h) # 這裡借用第三個回傳值顯示錯誤訊息
+                st.warning(f"**最近關鍵阻力/支撐位**：\n {', '.join([f'{l:.2f}' for l in nearby_levels])}")
+            
+            st.markdown("---")
 
-st.markdown("---")
-st.caption("說明：本工具使用 yfinance 數據，依據 MA 與 KD 指標進行機械化判定。")
+            # 2. 繪製圖表 (使用 mplfinance)
+            st.subheader("1️⃣ 日線圖 (Daily) - 自動繪製關鍵位")
+            
+            # 準備畫線的資料 (hlines)
+            hlines_data = [l[1] for l in levels]
+            
+            # 為了避免圖表太亂，我們只畫出距離目前價格最近的 5 條線
+            hlines_data.sort(key=lambda x: abs(x - current_price))
+            hlines_to_plot = hlines_data[:5]
+
+            # 繪製日線
+            fig_d, ax_d = mpf.plot(
+                df_d.tail(100), # 只畫最近100天
+                type='candle',
+                style='yahoo',
+                hlines=dict(hlines=hlines_to_plot, colors=['#FF9900']*len(hlines_to_plot), linestyle='-.', linewidths=1.5),
+                title=f"{symbol} Daily Chart (Orange Lines = Key Levels)",
+                returnfig=True,
+                volume=False
+            )
+            st.pyplot(fig_d)
+            
+            st.subheader("2️⃣ 4小時圖 (4H) - 尋找吞噬形態")
+            # 繪製 4H 線
+            fig_4h, ax_4h = mpf.plot(
+                df_4h.tail(50), # 只畫最近 50 根 4H K線
+                type='candle',
+                style='yahoo',
+                title=f"{symbol} 4-Hour Chart (Entry Timeframe)",
+                returnfig=True,
+                volume=False
+            )
+            st.pyplot(fig_4h)
+            
+            st.caption("說明：橘色虛線代表程式識別出的日線級別『關鍵支撐/阻力位』(曾多次轉折處)。")
+
+        else:
+            st.error("無法分析，請重試。")
