@@ -15,7 +15,6 @@ st.markdown("此工具不依賴 AI 圖片辨識，而是直接抓取數據進行
 # ==========================================
 with st.sidebar:
     st.header("參數設定")
-    # 讓使用者輸入代號，例如 BTC-USD 或 2330.TW
     symbol = st.text_input("輸入代號 (如 BTC-USD, AAPL, 2330.TW)", value="BTC-USD")
     
     st.markdown("---")
@@ -24,117 +23,141 @@ with st.sidebar:
     kd_threshold = st.number_input("4H KD 低檔買進區 (<數值)", value=30, max_value=50)
 
 # ==========================================
-# 3. 核心邏輯函數 (這就是你寫在程式裡的判斷)
+# 3. 核心邏輯函數 (修正了 Truth Value 錯誤)
 # ==========================================
 def fetch_and_analyze(symbol):
-    # 1. 抓取日線數據 (判斷大趨勢)
-    # yfinance 免費版限制：4H 數據較難抓，我們用 1H (小時線) 聚合或直接用 1H 當作進場週期
-    # 這裡為了展示，我們抓取最近 1 年的日線
-    df_day = yf.download(symbol, period="1y", interval="1d", progress=False)
-    
-    # 2. 抓取小時線數據 (模擬較短週期找買點)
-    # yfinance 只提供最近 730 天的小時級別數據
-    df_intraday = yf.download(symbol, period="1mo", interval="1h", progress=False)
+    try:
+        # 1. 抓取日線數據 (判斷大趨勢)
+        df_day = yf.download(symbol, period="1y", interval="1d", progress=False)
+        
+        # 2. 抓取小時線數據 (模擬 4H/短線 找買點)
+        df_intraday = yf.download(symbol, period="1mo", interval="1h", progress=False)
 
-    if df_day.empty or df_intraday.empty:
-        return None, None, "❌ 抓不到數據，請確認代號是否正確"
+        # --- 修正重點 A: 處理 yfinance 可能回傳的多層索引 (MultiIndex) ---
+        if isinstance(df_day.columns, pd.MultiIndex):
+            df_day.columns = df_day.columns.get_level_values(0)
+        if isinstance(df_intraday.columns, pd.MultiIndex):
+            df_intraday.columns = df_intraday.columns.get_level_values(0)
 
-    # --- 步驟 A: 日線邏輯 (寫死) ---
-    # 計算 SMA (移動平均線)
-    df_day['MA_Trend'] = ta.sma(df_day['Close'], length=ma_period)
-    
-    # 取得最新一天的收盤價與 MA
-    current_price = df_day['Close'].iloc[-1]
-    current_ma = df_day['MA_Trend'].iloc[-1]
-    
-    # 判斷趨勢
-    trend_status = "🟢 多頭 (看漲)" if current_price > current_ma else "🔴 空頭 (看跌)"
-    trend_bool = True if current_price > current_ma else False
+        # 檢查數據是否為空
+        if df_day.empty or df_intraday.empty:
+            return None, None, "❌ 抓不到數據，請確認代號是否正確"
 
-    # --- 步驟 B: 小時線/4H 邏輯 (寫死) ---
-    # 計算 KD 指標 (Stoch)
-    k_period = 9
-    d_period = 3
-    
-    # pandas_ta 會回傳 STOCHk 和 STOCHd
-    stoch = ta.stoch(df_intraday['High'], df_intraday['Low'], df_intraday['Close'], k=k_period, d=d_period)
-    
-    # 把計算結果合併回去
-    df_intraday = pd.concat([df_intraday, stoch], axis=1)
-    
-    # 取得最新的 K 和 D 值
-    # 欄位名稱通常是 STOCHk_9_3_3 和 STOCHd_9_3_3 (視套件版本而定，這裡用 iloc 取比較保險)
-    latest_k = df_intraday.iloc[-1, -2] # 倒數第二欄通常是 K
-    latest_d = df_intraday.iloc[-1, -1] # 倒數第一欄通常是 D
-    prev_k = df_intraday.iloc[-2, -2]
-    prev_d = df_intraday.iloc[-2, -1]
+        # --- 步驟 A: 日線邏輯 ---
+        # 計算 SMA
+        df_day['MA_Trend'] = ta.sma(df_day['Close'], length=ma_period)
+        
+        # 取得最新一天的收盤價與 MA (修正重點 B: 使用 .iloc[-1].item() 強制轉為純數字)
+        try:
+            current_price = df_day['Close'].iloc[-1]
+            # 如果是 Series (單一值但帶索引)，轉為 float
+            if isinstance(current_price, pd.Series):
+                current_price = float(current_price.iloc[0])
+            else:
+                current_price = float(current_price)
 
-    # 判斷是否黃金交叉 (現在 K > D 且 之前 K < D) 且 在低檔區
-    is_gold_cross = (latest_k > latest_d) and (prev_k < prev_d)
-    is_low_level = latest_k < kd_threshold
-    
-    entry_signal = "無訊號"
-    if is_gold_cross and is_low_level:
-        entry_signal = "🚀 黃金交叉 (買點出現!)"
-    elif is_low_level:
-        entry_signal = "⚠️ 進入超賣區 (等待交叉)"
-    else:
-        entry_signal = "觀望中"
+            current_ma = df_day['MA_Trend'].iloc[-1]
+            if isinstance(current_ma, pd.Series):
+                current_ma = float(current_ma.iloc[0])
+            else:
+                current_ma = float(current_ma)
+        except:
+            # 萬一數據不足導致無法計算
+            return None, None, "⚠️ 數據計算錯誤，可能是歷史資料不足"
+        
+        # 判斷趨勢
+        trend_bool = current_price > current_ma
+        trend_status = "🟢 多頭 (看漲)" if trend_bool else "🔴 空頭 (看跌)"
 
-    # --- 綜合建議 ---
-    advice = ""
-    if trend_bool and (is_gold_cross and is_low_level):
-        advice = "🔥 強烈建議買進 (趨勢向上 + 短線起漲)"
-    elif not trend_bool:
-        advice = "⛔ 日線趨勢向下，不建議做多"
-    else:
-        advice = "👀 趨勢向上，但短線尚未出現明確買訊"
+        # --- 步驟 B: 小時線/4H 邏輯 ---
+        # 計算 KD 指標
+        k_period = 9
+        d_period = 3
+        stoch = ta.stoch(df_intraday['High'], df_intraday['Low'], df_intraday['Close'], k=k_period, d=d_period)
+        
+        # 把計算結果合併回去
+        df_intraday = pd.concat([df_intraday, stoch], axis=1)
+        
+        # 取得 KD 值 (修正重點 C: 確保取出來的是純數字)
+        # STOCHk 和 STOCHd 通常在最後兩欄
+        def get_scalar(series_val):
+            if isinstance(series_val, pd.Series):
+                return float(series_val.iloc[0])
+            return float(series_val)
 
-    return {
-        "price": current_price,
-        "ma": current_ma,
-        "trend": trend_status,
-        "k": latest_k,
-        "d": latest_d,
-        "signal": entry_signal,
-        "advice": advice
-    }, df_day, df_intraday
+        latest_k = get_scalar(df_intraday.iloc[-1, -2])
+        latest_d = get_scalar(df_intraday.iloc[-1, -1])
+        prev_k = get_scalar(df_intraday.iloc[-2, -2])
+        prev_d = get_scalar(df_intraday.iloc[-2, -1])
+
+        # 判斷是否黃金交叉
+        # 現在 K > D 且 之前 K < D
+        is_gold_cross = (latest_k > latest_d) and (prev_k < prev_d)
+        is_low_level = latest_k < kd_threshold
+        
+        entry_signal = "無訊號"
+        if is_gold_cross and is_low_level:
+            entry_signal = "🚀 黃金交叉 (買點出現!)"
+        elif is_low_level:
+            entry_signal = "⚠️ 進入超賣區 (等待交叉)"
+        else:
+            entry_signal = "觀望中"
+
+        # --- 綜合建議 ---
+        advice = ""
+        if trend_bool and (is_gold_cross and is_low_level):
+            advice = "🔥 強烈建議買進 (趨勢向上 + 短線起漲)"
+        elif not trend_bool:
+            advice = "⛔ 日線趨勢向下，不建議做多"
+        else:
+            advice = "👀 趨勢向上，但短線尚未出現明確買訊"
+
+        return {
+            "price": current_price,
+            "ma": current_ma,
+            "trend": trend_status,
+            "k": latest_k,
+            "d": latest_d,
+            "signal": entry_signal,
+            "advice": advice
+        }, df_day, df_intraday
+
+    except Exception as e:
+        # 捕捉所有異常並回傳
+        return None, None, f"程式內部錯誤: {str(e)}"
 
 # ==========================================
 # 4. 執行與顯示
 # ==========================================
 if st.button("開始分析", type="primary"):
     with st.spinner("正在連線至交易所抓取數據並計算..."):
-        try:
-            result, df_d, df_h = fetch_and_analyze(symbol)
+        result, df_d, df_h = fetch_and_analyze(symbol)
+        
+        if result:
+            # 顯示結果
+            st.markdown(f"### 🎯 最終建議：{result['advice']}")
             
-            if result:
-                # 顯示大字報結果
-                st.markdown(f"### 🎯 最終建議：{result['advice']}")
-                
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    st.subheader("1. 日線趨勢分析")
-                    st.metric("目前價格", f"{result['price']:.2f}")
-                    st.metric(f"{ma_period}日均線 (MA)", f"{result['ma']:.2f}")
-                    st.info(f"趨勢判定：{result['trend']}")
-                    # 畫圖
-                    st.line_chart(df_d[['Close', 'MA_Trend']])
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.subheader("1. 日線趨勢分析")
+                st.metric("目前價格", f"{result['price']:.2f}")
+                st.metric(f"{ma_period}日均線 (MA)", f"{result['ma']:.2f}")
+                st.info(f"趨勢判定：{result['trend']}")
+                st.line_chart(df_d[['Close', 'MA_Trend']])
 
-                with col2:
-                    st.subheader("2. 短線進場分析 (KD指標)")
-                    st.metric("K值", f"{result['k']:.2f}")
-                    st.metric("D值", f"{result['d']:.2f}")
-                    st.info(f"訊號判定：{result['signal']}")
-                    # 畫 KD 線 (只畫最近 100 根 bar 以免太密)
+            with col2:
+                st.subheader("2. 短線進場分析 (KD指標)")
+                st.metric("K值", f"{result['k']:.2f}")
+                st.metric("D值", f"{result['d']:.2f}")
+                st.info(f"訊號判定：{result['signal']}")
+                # 畫 KD 線 (只畫最近 100 根)
+                if df_h is not None and df_h.shape[1] > 2:
                     st.line_chart(df_h.iloc[-100:, -2:]) 
-            
-            else:
-                st.error("分析失敗，請檢查代號")
-                
-        except Exception as e:
-            st.error(f"程式發生錯誤: {e}")
+        
+        else:
+            # 顯示 fetch_and_analyze 回傳的錯誤訊息
+            st.error(df_h) # 這裡借用第三個回傳值顯示錯誤訊息
 
 st.markdown("---")
 st.caption("說明：本工具使用 yfinance 數據，依據 MA 與 KD 指標進行機械化判定。")
