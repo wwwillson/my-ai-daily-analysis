@@ -8,9 +8,10 @@ import numpy as np
 # 1. 頁面設定
 # ==========================================
 st.set_page_config(layout="wide", page_title="Price Action 波段策略分析")
-st.title("📈 雙時區 Price Action 策略 (仿影片邏輯)")
+# 修改 1: 移除標題中的 (仿影片邏輯)
+st.title("📈 雙時區 Price Action 策略") 
 st.markdown("""
-**策略核心 (基於影片歸納)：**
+**策略核心：**
 1. **日線 (Daily)**：識別趨勢，自動尋找並畫出「關鍵支撐/阻力位」(Key Levels)。
 2. **4小時 (4H)**：在關鍵位附近尋找「吞噬形態 (Engulfing)」作為入場確認。
 """)
@@ -22,7 +23,6 @@ with st.sidebar:
     st.header("設定")
     symbol = st.text_input("輸入代號 (如 BTC-USD, NVDA, 2330.TW)", value="BTC-USD")
     lookback_days = st.slider("日線回溯天數 (找支撐壓力用)", 100, 730, 365)
-    # 增加靈敏度調整
     st.markdown("---")
     st.info("提示：若找不到數據，請確認代號是否正確。")
 
@@ -32,7 +32,6 @@ with st.sidebar:
 
 def is_support(df, i):
     # 判斷是否為局部低點 (Fractal Low)
-    # 使用 iloc 確保取值正確
     try:
         cond1 = df['Low'].iloc[i] < df['Low'].iloc[i-1]
         cond2 = df['Low'].iloc[i] < df['Low'].iloc[i+1]
@@ -53,41 +52,34 @@ def is_resistance(df, i):
     except:
         return False
 
-def find_levels(df):
-    # 尋找關鍵支撐與壓力位
-    levels = []
-    # 使用平均蠟燭長度來過濾太近的線
-    mean_candle_size = np.mean(df['High'] - df['Low'])
-    
-    for i in range(2, df.shape[0] - 2):
-        if is_support(df, i):
-            l = float(df['Low'].iloc[i])
-            # 修正重點：x[1] 才是價格，x 是 (index, price, type)
-            if is_far_from_existing(l, levels, mean_candle_size):
-                levels.append((i, l, "Support"))
-                
-        elif is_resistance(df, i):
-            l = float(df['High'].iloc[i])
-            # 修正重點：x[1] 才是價格
-            if is_far_from_existing(l, levels, mean_candle_size):
-                levels.append((i, l, "Resistance"))
-    return levels
-
 def is_far_from_existing(l, levels, mean_candle_size):
     # 輔助函數：檢查是否與現有線條太近
-    # 如果 levels 是空的，直接回傳 True
     if len(levels) == 0:
         return True
-    
-    # 這裡的 x[1] 修正了原本報錯的原因
     for x in levels:
         if abs(l - x[1]) < mean_candle_size * 2:
             return False
     return True
 
+def find_levels(df):
+    # 尋找關鍵支撐與壓力位
+    levels = []
+    mean_candle_size = np.mean(df['High'] - df['Low'])
+    
+    for i in range(2, df.shape[0] - 2):
+        if is_support(df, i):
+            l = float(df['Low'].iloc[i])
+            if is_far_from_existing(l, levels, mean_candle_size):
+                levels.append((i, l, "Support"))
+                
+        elif is_resistance(df, i):
+            l = float(df['High'].iloc[i])
+            if is_far_from_existing(l, levels, mean_candle_size):
+                levels.append((i, l, "Resistance"))
+    return levels
+
 def check_engulfing(open_curr, close_curr, open_prev, close_prev, trend_direction):
     # 判斷吞噬形態
-    # 確保輸入是 float
     open_curr, close_curr = float(open_curr), float(close_curr)
     open_prev, close_prev = float(open_prev), float(close_prev)
 
@@ -113,7 +105,6 @@ def fetch_data(symbol, days):
         # 2. 抓取小時線並重組為 4小時線
         df_1h = yf.download(symbol, period="1mo", interval="1h", progress=False)
         
-        # 處理 MultiIndex (yfinance 新版修正)
         if isinstance(df_daily.columns, pd.MultiIndex):
             df_daily.columns = df_daily.columns.get_level_values(0)
         if isinstance(df_1h.columns, pd.MultiIndex):
@@ -130,7 +121,6 @@ def fetch_data(symbol, days):
             'Close': 'last',
             'Volume': 'sum'
         }
-        # 確保索引是 DatetimeIndex
         df_1h.index = pd.to_datetime(df_1h.index)
         df_4h = df_1h.resample('4h').agg(ohlc_dict).dropna()
 
@@ -154,24 +144,23 @@ if st.button("🚀 開始智能分析", type="primary"):
             levels = find_levels(df_d)
             current_price = float(df_d['Close'].iloc[-1])
             
-            # 簡單趨勢過濾 (價格 vs 50MA)
             ma50 = df_d['Close'].rolling(50).mean().iloc[-1]
             trend = "UP" if current_price > float(ma50) else "DOWN"
             
-            # 找出最近的關鍵位 (只顯示最近的 2 條線)
             level_prices = [l[1] for l in levels]
-            # 避免沒有找到任何支撐壓力的情況
             nearby_levels = []
+            
+            # 找出最近的關鍵位
+            closest_level = None
             if level_prices:
                 level_prices.sort(key=lambda x: abs(x - current_price))
                 nearby_levels = level_prices[:2]
+                closest_level = nearby_levels[0] # 取得最接近的一條
 
             # --- B. 4H 分析 (入場訊號) ---
-            # 確保有足夠的 K 線
             if len(df_4h) >= 2:
                 curr_4h = df_4h.iloc[-1]
                 prev_4h = df_4h.iloc[-2]
-                
                 signal = check_engulfing(
                     curr_4h['Open'], curr_4h['Close'], 
                     prev_4h['Open'], prev_4h['Close'], 
@@ -183,7 +172,7 @@ if st.button("🚀 開始智能分析", type="primary"):
             # 判斷價格是否靠近關鍵位 (Buffer 2%)
             is_near_level = False
             for lvl in nearby_levels:
-                if abs(current_price - lvl) / current_price < 0.02: # 2% 誤差內
+                if abs(current_price - lvl) / current_price < 0.02: 
                     is_near_level = True
             
             final_decision = "觀望"
@@ -195,8 +184,6 @@ if st.button("🚀 開始智能分析", type="primary"):
                 final_decision = "👀 價格回到關鍵位 (等待 4H 吞噬形態)"
 
             # --- C. 顯示結果 ---
-            
-            # 1. 文字報告
             st.markdown(f"### 🎯 分析結果：{final_decision}")
             col1, col2 = st.columns(2)
             with col1:
@@ -210,16 +197,12 @@ if st.button("🚀 開始智能分析", type="primary"):
             
             st.markdown("---")
 
-            # 2. 繪製圖表 (使用 mplfinance)
+            # 1. 繪製日線圖
             st.subheader("1️⃣ 日線圖 (Daily) - 自動繪製關鍵位")
-            
-            # 準備畫線的資料 (hlines)
             if level_prices:
-                hlines_to_plot = level_prices[:5] # 只畫最近5條
-                
-                # 繪製日線
+                hlines_to_plot = level_prices[:5] # 日線圖畫出最近5條
                 fig_d, ax_d = mpf.plot(
-                    df_d.tail(100), # 只畫最近100天
+                    df_d.tail(100),
                     type='candle',
                     style='yahoo',
                     hlines=dict(hlines=hlines_to_plot, colors=['#FF9900']*len(hlines_to_plot), linestyle='-.', linewidths=1.5),
@@ -230,28 +213,36 @@ if st.button("🚀 開始智能分析", type="primary"):
                 st.pyplot(fig_d)
             else:
                 fig_d, ax_d = mpf.plot(
-                    df_d.tail(100),
-                    type='candle',
-                    style='yahoo',
-                    title=f"{symbol} Daily Chart",
-                    returnfig=True,
-                    volume=False
+                    df_d.tail(100), type='candle', style='yahoo', title=f"{symbol} Daily Chart", returnfig=True, volume=False
                 )
                 st.pyplot(fig_d)
             
+            # 2. 繪製 4H 圖 (修改 2: 在 4H 圖上畫出最接近的那一條線)
             st.subheader("2️⃣ 4小時圖 (4H) - 尋找吞噬形態")
-            # 繪製 4H 線
-            fig_4h, ax_4h = mpf.plot(
-                df_4h.tail(50), # 只畫最近 50 根 4H K線
-                type='candle',
-                style='yahoo',
-                title=f"{symbol} 4-Hour Chart (Entry Timeframe)",
-                returnfig=True,
-                volume=False
-            )
-            st.pyplot(fig_4h)
             
-            st.caption("說明：橘色虛線代表程式識別出的日線級別『關鍵支撐/阻力位』(曾多次轉折處)。")
+            if closest_level:
+                fig_4h, ax_4h = mpf.plot(
+                    df_4h.tail(50),
+                    type='candle',
+                    style='yahoo',
+                    # 在這裡畫出最接近的那一條關鍵位
+                    hlines=dict(hlines=[closest_level], colors=['#FF9900'], linestyle='--', linewidths=2.0),
+                    title=f"{symbol} 4-Hour Chart (With Closest Daily Key Level)",
+                    returnfig=True,
+                    volume=False
+                )
+                st.pyplot(fig_4h)
+                st.caption(f"說明：橘色虛線 ({closest_level:.2f}) 為目前最接近的日線級別關鍵位，請觀察 K 線是否在此處形成形態。")
+            else:
+                fig_4h, ax_4h = mpf.plot(
+                    df_4h.tail(50),
+                    type='candle',
+                    style='yahoo',
+                    title=f"{symbol} 4-Hour Chart",
+                    returnfig=True,
+                    volume=False
+                )
+                st.pyplot(fig_4h)
 
         else:
             st.error("無法分析，請重試或更換代號。")
