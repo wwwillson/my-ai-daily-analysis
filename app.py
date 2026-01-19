@@ -1,19 +1,20 @@
 import streamlit as st
-import yfinance as yf
+import ccxt
 import pandas as pd
 import mplfinance as mpf
 import numpy as np
+from datetime import datetime
 
 # ==========================================
 # 1. 頁面設定
 # ==========================================
-st.set_page_config(layout="wide", page_title="Price Action 波段策略分析")
-# 修改 1: 移除標題中的 (仿影片邏輯)
-st.title("📈 雙時區 Price Action 策略") 
+st.set_page_config(layout="wide", page_title="Binance US PA 策略分析")
+st.title("📈 雙時區 Price Action 策略 (Binance US)") 
 st.markdown("""
 **策略核心：**
 1. **日線 (Daily)**：識別趨勢，自動尋找並畫出「關鍵支撐/阻力位」(Key Levels)。
 2. **4小時 (4H)**：在關鍵位附近尋找「吞噬形態 (Engulfing)」作為入場確認。
+3. **時區**：所有時間已轉換為 **台灣時間 (Asia/Taipei)**。
 """)
 
 # ==========================================
@@ -21,10 +22,10 @@ st.markdown("""
 # ==========================================
 with st.sidebar:
     st.header("設定")
-    symbol = st.text_input("輸入代號 (如 BTC-USD, NVDA, 2330.TW)", value="BTC-USD")
+    symbol = st.text_input("輸入交易對 (如 BTC/USDT, ETH/USD)", value="BTC/USDT")
     lookback_days = st.slider("日線回溯天數 (找支撐壓力用)", 100, 730, 365)
     st.markdown("---")
-    st.info("提示：若找不到數據，請確認代號是否正確。")
+    st.info("提示：Binance US 代號通常為 'XXX/USDT' 或 'XXX/USD'。")
 
 # ==========================================
 # 3. 核心運算函數
@@ -97,44 +98,56 @@ def check_engulfing(open_curr, close_curr, open_prev, close_prev, trend_directio
     
     return None
 
-def fetch_data(symbol, days):
+def fetch_binance_data(symbol, days):
+    """
+    使用 CCXT 抓取 Binance US 數據並轉換為台灣時間
+    """
     try:
-        # 1. 抓取日線
-        df_daily = yf.download(symbol, period=f"{days}d", interval="1d", progress=False)
+        # 初始化 Binance US
+        exchange = ccxt.binanceus({
+            'enableRateLimit': True,
+        })
         
-        # 2. 抓取小時線並重組為 4小時線
-        df_1h = yf.download(symbol, period="1mo", interval="1h", progress=False)
-        
-        if isinstance(df_daily.columns, pd.MultiIndex):
-            df_daily.columns = df_daily.columns.get_level_values(0)
-        if isinstance(df_1h.columns, pd.MultiIndex):
-            df_1h.columns = df_1h.columns.get_level_values(0)
+        # 檢查代號是否存在 (非必要，但可增加穩定性)
+        # exchange.load_markets() 
+
+        # ---------------------------
+        # 1. 抓取日線 (Daily)
+        # ---------------------------
+        # Binance 最多一次抓 1000 根，通常夠用
+        ohlcv_d = exchange.fetch_ohlcv(symbol, timeframe='1d', limit=days)
+        if not ohlcv_d:
+            return None, None, "抓取不到日線數據，請確認代號 (例如 BTC/USDT)。"
             
-        if df_daily.empty or df_1h.empty:
-            return None, None, "抓取不到數據，請確認代號或市場是否開盤。"
+        df_d = pd.DataFrame(ohlcv_d, columns=['timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+        # 轉換時間戳記 -> UTC -> 台灣時間
+        df_d['timestamp'] = pd.to_datetime(df_d['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert('Asia/Taipei')
+        df_d.set_index('timestamp', inplace=True)
 
-        # 重採樣 1H -> 4H
-        ohlc_dict = {
-            'Open': 'first',
-            'High': 'max',
-            'Low': 'min',
-            'Close': 'last',
-            'Volume': 'sum'
-        }
-        df_1h.index = pd.to_datetime(df_1h.index)
-        df_4h = df_1h.resample('4h').agg(ohlc_dict).dropna()
+        # ---------------------------
+        # 2. 抓取 4小時線 (4H)
+        # ---------------------------
+        # Binance 原生支援 4h，不需要 Resample
+        ohlcv_4h = exchange.fetch_ohlcv(symbol, timeframe='4h', limit=100) # 抓最近 100 根 4H
+        if not ohlcv_4h:
+            return None, None, "抓取不到 4H 數據。"
+            
+        df_4h = pd.DataFrame(ohlcv_4h, columns=['timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+        # 轉換時間戳記 -> UTC -> 台灣時間
+        df_4h['timestamp'] = pd.to_datetime(df_4h['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert('Asia/Taipei')
+        df_4h.set_index('timestamp', inplace=True)
 
-        return df_daily, df_4h, None
+        return df_d, df_4h, None
 
     except Exception as e:
-        return None, None, str(e)
+        return None, None, f"API 錯誤: {str(e)}"
 
 # ==========================================
 # 4. 分析與顯示邏輯
 # ==========================================
 if st.button("🚀 開始智能分析", type="primary"):
-    with st.spinner("正在進行雙時區結構運算..."):
-        df_d, df_4h, err = fetch_data(symbol, lookback_days)
+    with st.spinner(f"正在連線 Binance US 獲取 {symbol} 數據..."):
+        df_d, df_4h, err = fetch_binance_data(symbol, lookback_days)
         
         if err:
             st.error(f"錯誤: {err}")
@@ -144,8 +157,13 @@ if st.button("🚀 開始智能分析", type="primary"):
             levels = find_levels(df_d)
             current_price = float(df_d['Close'].iloc[-1])
             
-            ma50 = df_d['Close'].rolling(50).mean().iloc[-1]
-            trend = "UP" if current_price > float(ma50) else "DOWN"
+            # 確保數據足夠計算 MA50
+            if len(df_d) >= 50:
+                ma50 = df_d['Close'].rolling(50).mean().iloc[-1]
+                trend = "UP" if current_price > float(ma50) else "DOWN"
+            else:
+                trend = "RANGE"
+                ma50 = 0
             
             level_prices = [l[1] for l in levels]
             nearby_levels = []
@@ -187,8 +205,10 @@ if st.button("🚀 開始智能分析", type="primary"):
             st.markdown(f"### 🎯 分析結果：{final_decision}")
             col1, col2 = st.columns(2)
             with col1:
-                st.info(f"**日線趨勢**：{'📈 上升 (價格 > 50MA)' if trend=='UP' else '📉 下跌 (價格 < 50MA)'}")
-                st.metric("目前價格", f"{current_price:.2f}")
+                trend_str = '📈 上升' if trend=='UP' else '📉 下跌'
+                if trend == "RANGE": trend_str = "↔️ 震盪/數據不足"
+                st.info(f"**日線趨勢 (vs 50MA)**：{trend_str}")
+                st.metric("目前價格 (USDT/USD)", f"{current_price:.2f}")
             with col2:
                 if nearby_levels:
                     st.warning(f"**最近關鍵阻力/支撐位**：\n {', '.join([f'{l:.2f}' for l in nearby_levels])}")
@@ -197,52 +217,64 @@ if st.button("🚀 開始智能分析", type="primary"):
             
             st.markdown("---")
 
+            # 定義 MPF 樣式，適配 Streamlit 深色主題
+            mc = mpf.make_marketcolors(up='#00ff00', down='#ff0000', inherit=True)
+            s  = mpf.make_mpf_style(marketcolors=mc, style='nightclouds')
+
             # 1. 繪製日線圖
-            st.subheader("1️⃣ 日線圖 (Daily) - 自動繪製關鍵位")
+            st.subheader("1️⃣ 日線圖 (Daily) - 台灣時間")
             if level_prices:
                 hlines_to_plot = level_prices[:5] # 日線圖畫出最近5條
                 fig_d, ax_d = mpf.plot(
                     df_d.tail(100),
                     type='candle',
-                    style='yahoo',
-                    hlines=dict(hlines=hlines_to_plot, colors=['#FF9900']*len(hlines_to_plot), linestyle='-.', linewidths=1.5),
-                    title=f"{symbol} Daily Chart (Key Levels)",
+                    style=s,
+                    hlines=dict(hlines=hlines_to_plot, colors=['#FF9900']*len(hlines_to_plot), linestyle='-.', linewidths=1.0),
+                    title=f"{symbol} Daily Chart (Taiwan Time)",
                     returnfig=True,
-                    volume=False
+                    volume=False,
+                    datetime_format='%Y-%m-%d', # 日線格式
+                    tight_layout=True
                 )
                 st.pyplot(fig_d)
             else:
                 fig_d, ax_d = mpf.plot(
-                    df_d.tail(100), type='candle', style='yahoo', title=f"{symbol} Daily Chart", returnfig=True, volume=False
+                    df_d.tail(100), type='candle', style=s, title=f"{symbol} Daily Chart", returnfig=True, volume=False, tight_layout=True
                 )
                 st.pyplot(fig_d)
             
-            # 2. 繪製 4H 圖 (修改 2: 在 4H 圖上畫出最接近的那一條線)
-            st.subheader("2️⃣ 4小時圖 (4H) - 尋找吞噬形態")
+            # 2. 繪製 4H 圖
+            st.subheader("2️⃣ 4小時圖 (4H) - 台灣時間")
+            
+            # 準備在 4H 圖上的標題，加上時間
+            latest_time = df_4h.index[-1].strftime('%Y-%m-%d %H:%M')
             
             if closest_level:
                 fig_4h, ax_4h = mpf.plot(
                     df_4h.tail(50),
                     type='candle',
-                    style='yahoo',
-                    # 在這裡畫出最接近的那一條關鍵位
-                    hlines=dict(hlines=[closest_level], colors=['#FF9900'], linestyle='--', linewidths=2.0),
-                    title=f"{symbol} 4-Hour Chart (With Closest Daily Key Level)",
+                    style=s,
+                    hlines=dict(hlines=[closest_level], colors=['#FF9900'], linestyle='--', linewidths=1.5),
+                    title=f"{symbol} 4H Chart (Last: {latest_time})",
                     returnfig=True,
-                    volume=False
+                    volume=False,
+                    datetime_format='%m-%d %H:%M', # 4H 顯示月-日 時:分
+                    tight_layout=True
                 )
                 st.pyplot(fig_4h)
-                st.caption(f"說明：橘色虛線 ({closest_level:.2f}) 為目前最接近的日線級別關鍵位，請觀察 K 線是否在此處形成形態。")
+                st.caption(f"說明：橘色虛線 ({closest_level:.2f}) 為目前最接近的日線級別關鍵位。")
             else:
                 fig_4h, ax_4h = mpf.plot(
                     df_4h.tail(50),
                     type='candle',
-                    style='yahoo',
-                    title=f"{symbol} 4-Hour Chart",
+                    style=s,
+                    title=f"{symbol} 4H Chart (Last: {latest_time})",
                     returnfig=True,
-                    volume=False
+                    volume=False,
+                    datetime_format='%m-%d %H:%M',
+                    tight_layout=True
                 )
                 st.pyplot(fig_4h)
 
         else:
-            st.error("無法分析，請重試或更換代號。")
+            st.error("無法分析，請確認交易對是否正確 (Binance US 需大寫且包含計價幣，如 BTC/USDT)。")
