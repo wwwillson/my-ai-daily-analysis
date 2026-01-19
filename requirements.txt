@@ -1,6 +1,5 @@
 streamlit
-yfinance
-pandas_ta
+ccxt
 mplfinance
 pandas
 numpy
