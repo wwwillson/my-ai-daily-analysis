@@ -3,3 +3,4 @@ ccxt
 mplfinance
 pandas
 numpy
+streamlit-autorefresh
